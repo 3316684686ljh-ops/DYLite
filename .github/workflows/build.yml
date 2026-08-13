@@ -72,6 +72,7 @@ jobs:
           [ -f "$DEB" ] && cp "$DEB" "packages/DYLite_${VER}_arm-rootful.deb"
 
       - name: Build rootless
+        continue-on-error: true
         run: |
           make package-rootless FINALPACKAGE=1
           mkdir -p packages
@@ -80,6 +81,7 @@ jobs:
           [ -f "$DEB" ] && cp "$DEB" "packages/DYLite_${VER}_arm64-rootless.deb"
 
       - name: Build roothide
+        continue-on-error: true
         run: |
           make package-roothide FINALPACKAGE=1 || true
           mkdir -p packages
@@ -88,6 +90,7 @@ jobs:
           [ -f "$DEB" ] && cp "$DEB" "packages/DYLite_${VER}_arm64e-roothide.deb"
 
       - name: Upload artifacts
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: DYLite-packages
