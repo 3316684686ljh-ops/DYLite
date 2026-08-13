@@ -73,6 +73,7 @@
 @property (nonatomic, copy) NSString *detail;
 @property (nonatomic, assign) NSInteger type;
 @property (nonatomic, assign) NSInteger cellType;
+@property (nonatomic, assign) NSInteger colorStyle;   // DKSettingsMenu.xm 56/128 行需要
 @property (nonatomic, assign) BOOL isEnable;
 @property (nonatomic, assign) BOOL isSwitchOn;
 @property (nonatomic, copy) void (^cellTappedBlock)(void);
