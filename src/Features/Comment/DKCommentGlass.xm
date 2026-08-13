@@ -284,15 +284,13 @@ static void DKCommentGlassUpdate(id controller) {
         return DKMakeSwitch(
             DKKeyCommentGlass,
             @"评论区液态玻璃",
-            @"给评论面板和输入框添加 iOS 26 液态玻璃效果（需要 iOS 26+）",
-            YES);
+            @"给评论面板和输入框添加 iOS 26 液态玻璃效果（需要 iOS 26+）");
     });
     DKSettingsRegisterItem(@"评论区", ^AWESettingItemModel *{
         return DKMakeSwitch(
             DKKeyCommentGlassClear,
             @"评论区玻璃 Clear 风格",
-            @"使用透明的液态玻璃（需开启上面的开关）",
-            YES);
+            @"使用透明的液态玻璃（需开启上面的开关）");
     });
 
     // 运行时守卫已在功能内部（DKCommentGlassEnabled/DKGlassEffectClassAvailable），
