@@ -217,20 +217,26 @@ static BOOL DKIsDYLiteVM(id vm) {
             (void)[detailVm sectionDataArray];
 
             // 创建设置页 VC：优先尝试官方的初始化方法，失败再 fallback
+            // 【重要】不要用 %c(AWESettingBaseViewController)，因为这个类是抖音二进制里的动态类，
+            // 我们编译/链接时没有这个类的 OBJC_CLASS 符号，会导致 ld Undefined symbols。
+            // 改用 NSClassFromString 运行时取类，不会产生硬链接符号。
+            Class settingVCCls = NSClassFromString(@"AWESettingBaseViewController");
             AWESettingBaseViewController *detailVc = nil;
-            @try {
-                // 尝试 initWithViewModel:（如有）
-                SEL initSel = NSSelectorFromString(@"initWithViewModel:");
-                if ([[AWESettingBaseViewController class] instancesRespondToSelector:initSel]) {
-                    id (*msgSend)(id, SEL, id) = (typeof(msgSend))objc_msgSend;
-                    detailVc = msgSend([%c(AWESettingBaseViewController) alloc], initSel, detailVm);
-                }
-            } @catch (__unused NSException *e) {}
+            if (settingVCCls) {
+                @try {
+                    // 尝试 initWithViewModel:（如有）
+                    SEL initSel = NSSelectorFromString(@"initWithViewModel:");
+                    if ([settingVCCls instancesRespondToSelector:initSel]) {
+                        id (*msgSend)(id, SEL, id) = (typeof(msgSend))objc_msgSend;
+                        detailVc = msgSend([settingVCCls alloc], initSel, detailVm);
+                    }
+                } @catch (__unused NSException *e) {}
 
-            if (!detailVc) {
-                detailVc = [[%c(AWESettingBaseViewController) alloc] init];
-                if (detailVc) {
-                    @try { [detailVc setValue:detailVm forKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+                if (!detailVc) {
+                    detailVc = [[settingVCCls alloc] init];
+                    if (detailVc) {
+                        @try { [detailVc setValue:detailVm forKey:@"viewModel"]; } @catch (__unused NSException *e) {}
+                    }
                 }
             }
             if (!detailVc) return;
