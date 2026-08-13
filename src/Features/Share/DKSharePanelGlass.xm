@@ -279,7 +279,6 @@ static void DKShareGlassThemeReload(void) {
         return item;
     });
 
-    if (DKGlassOSAvailable()) {
-        %init(DKShareGlassHooks);
-    }
+    // 运行时守卫已在功能内部，直接 init group 避免 Logos scope 问题
+    %init(DKShareGlassHooks);
 }
