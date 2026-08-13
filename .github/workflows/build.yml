@@ -26,6 +26,9 @@ jobs:
       - name: Install xz support
         run: brew install xz || true
 
+      - name: Install ldid (iOS signing tool)
+        run: brew install ldid || true
+
       - name: Setup iPhoneOS SDK
         run: |
           set -e
@@ -99,4 +102,4 @@ jobs:
           files: packages/*
           generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}  
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
