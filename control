@@ -1,0 +1,10 @@
+Package: com.yourname.dylite
+Name: DYLite
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: 抖音 UI 增强插件精简版（玻璃效果/全屏/元素清理）
+Section: Tweaks
+Depends: firmware (>= 14.0), mobilesubstrate
+Maintainer: YourName
+Author: YourName
+Priority: optional

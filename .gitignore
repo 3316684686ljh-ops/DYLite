@@ -1,0 +1,22 @@
+# 忽略编译产物
+.theos/
+packages/
+obj/
+
+# 忽略 macOS 系统文件
+.DS_Store
+
+# 忽略 IDE 文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 忽略本地配置
+.local/
+
+# 忽略本地推送脚本（含Token）
+设置推送Token.bat
+*Token*.bat
+*token*.bat

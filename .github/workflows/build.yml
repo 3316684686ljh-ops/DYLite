@@ -1,0 +1,90 @@
+name: Build DYLite
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build DYLite (.deb)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Theos
+        run: |
+          echo "==> Cloning Theos"
+          git clone --recursive https://github.com/theos/theos.git ~/theos
+
+      - name: Download iOS SDK
+        run: |
+          echo "==> Downloading iPhoneOS SDK"
+          mkdir -p ~/theos/sdks
+          curl -L "https://github.com/xybp888/iOS-SDKs/releases/download/17.5/iPhoneOS17.5.sdk.tar.gz" -o /tmp/sdk.tar.gz
+          mkdir -p ~/theos/sdks/iPhoneOS17.5.sdk
+          tar -xzf /tmp/sdk.tar.gz -C ~/theos/sdks/iPhoneOS17.5.sdk --strip-components=1
+          echo "==> SDK extracted"
+          ls ~/theos/sdks/
+
+      - name: Setup environment
+        run: |
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+
+      - name: Build rootful package
+        run: |
+          make package-rootful FINALPACKAGE=1
+          mkdir -p packages
+          DEB=$(cat .theos/last_package 2>/dev/null)
+          if [ -n "$DEB" ] && [ -f "$DEB" ]; then
+            cp "$DEB" "packages/DYLite_$(grep 'Version:' control | awk '{print $2}')_arm-rootful.deb"
+          fi
+
+      - name: Build rootless package
+        run: |
+          make package-rootless FINALPACKAGE=1
+          mkdir -p packages
+          DEB=$(cat .theos/last_package 2>/dev/null)
+          if [ -n "$DEB" ] && [ -f "$DEB" ]; then
+            cp "$DEB" "packages/DYLite_$(grep 'Version:' control | awk '{print $2}')_arm64-rootless.deb"
+          fi
+
+      - name: Build roothide package
+        run: |
+          make package-roothide FINALPACKAGE=1 || echo "roothide build skipped"
+          mkdir -p packages
+          DEB=$(cat .theos/last_package 2>/dev/null)
+          if [ -n "$DEB" ] && [ -f "$DEB" ]; then
+            cp "$DEB" "packages/DYLite_$(grep 'Version:' control | awk '{print $2}')_arm64e-roothide.deb"
+          fi
+
+      - name: List built packages
+        run: |
+          echo "==> All built packages:"
+          ls -la packages/ 2>/dev/null || echo "(no packages)"
+          echo "==> Done!"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: DYLite-packages
+          path: packages/*
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: packages/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
