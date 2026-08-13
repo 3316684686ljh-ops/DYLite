@@ -109,7 +109,90 @@ static BOOL DKSettingsReadValue(NSString *key) {
     self.tableView.estimatedRowHeight = 60;
     self.tableView.rowHeight = UITableViewAutomaticDimension;
 
+    // 左上角返回按钮（因为是 present 弹出的，系统不会自动加返回键）
+    self.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc]
+        initWithTitle:@"返回"
+                style:UIBarButtonItemStylePlain
+               target:self
+               action:@selector(dk_dismiss)];
+
+    // 顶部 headerView：提示 + 一键操作按钮（解决"功能都不生效"的第一感知问题）
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 320, 170)];
+    header.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+
+    UILabel *tip = [[UILabel alloc] initWithFrame:CGRectMake(16, 14, header.bounds.size.width - 32, 54)];
+    tip.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    tip.numberOfLines = 0;
+    tip.font = [UIFont systemFontOfSize:13];
+    tip.textColor = [UIColor darkGrayColor];
+    tip.text = @"修改开关后建议重开抖音让设置完全生效。\n嫌麻烦可以点击下方按钮一键关闭抖音，然后手动再打开即可。";
+
+    UIButton *allOn = [UIButton buttonWithType:UIButtonTypeSystem];
+    allOn.frame = CGRectMake(16, 76, header.bounds.size.width - 32, 38);
+    allOn.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [allOn setTitle:@"一键开启所有推荐功能" forState:UIControlStateNormal];
+    allOn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    allOn.layer.cornerRadius = 10;
+    allOn.backgroundColor = [[UIColor systemBlueColor] colorWithAlphaComponent:0.08];
+    [allOn addTarget:self action:@selector(dk_enableAll) forControlEvents:UIControlEventTouchUpInside];
+
+    UIButton *restart = [UIButton buttonWithType:UIButtonTypeSystem];
+    restart.frame = CGRectMake(16, 122, header.bounds.size.width - 32, 38);
+    restart.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    [restart setTitle:@"立即关闭抖音（重开后设置生效）" forState:UIControlStateNormal];
+    restart.titleLabel.font = [UIFont systemFontOfSize:14];
+    restart.layer.cornerRadius = 10;
+    restart.backgroundColor = [[UIColor systemRedColor] colorWithAlphaComponent:0.08];
+    [restart addTarget:self action:@selector(dk_killDouyin) forControlEvents:UIControlEventTouchUpInside];
+
+    [header addSubview:tip];
+    [header addSubview:allOn];
+    [header addSubview:restart];
+    self.tableView.tableHeaderView = header;
+
     [self dk_buildSections];
+}
+
+- (void)dk_dismiss {
+    [self.presentingViewController dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)dk_enableAll {
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    NSArray<NSString *> *allKeys = @[
+        DKKeyNumberAbbreviation,
+        DKKeyVideoFullscreen,
+        DKKeyRemoveFollowButton,
+        DKKeyRemoveQushuiting,
+    ];
+    for (NSString *k in allKeys) [ud setBool:YES forKey:k];
+
+    // 玻璃相关：仅在支持的系统上开启
+    if (DKGlassOSAvailable()) {
+        [ud setBool:YES forKey:DKKeyCommentGlass];
+        [ud setBool:YES forKey:DKKeySharePanelGlass];
+    }
+    [ud synchronize];
+    [self.tableView reloadData];
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已开启全部推荐功能"
+                                                                 message:@"建议重开抖音让所有设置生效。"
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"立即关闭抖音"
+                                            style:UIAlertActionStyleDestructive
+                                          handler:^(__unused UIAlertAction * _Nonnull action) {
+        [self dk_killDouyin];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)dk_killDouyin {
+    // 温和退出：让系统把抖音进程正常清理掉
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        exit(0);
+    });
 }
 
 - (void)dk_buildSections {
@@ -222,11 +305,33 @@ static BOOL DKSettingsReadValue(NSString *key) {
         id raw = _dkSections[section][@"items"][row];
         if (![raw isKindOfClass:NSClassFromString(@"AWESettingItemModel")]) return;
         AWESettingItemModel *item = (AWESettingItemModel *)raw;
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        [ud setBool:sender.on forKey:item.identifier];
-        [ud synchronize];
-        item.isSwitchOn = sender.on;
+
+        // 【关键】switchChangedBlock 在 DKMakeSwitch 内部实现是：
+        //   BOOL v = !it.isSwitchOn;  it.isSwitchOn = v;  [UD setBool:v forKey:]
+        // 它是基于 item.isSwitchOn 做"翻转"的，所以如果要最终写入 sender.on 的值，
+        // 调用前先把 item.isSwitchOn 设为 !sender.on，这样翻转后就是 sender.on。
+        // 好处：同时执行 Share/玻璃等功能在 switchChangedBlock 里追加的额外逻辑（如 gGlassStyle 重置）
+        item.isSwitchOn = !sender.on;
+        if (item.switchChangedBlock) {
+            item.switchChangedBlock();
+        } else {
+            // 兜底：没有 block 时手动写 NSUserDefaults
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            [ud setBool:sender.on forKey:item.identifier];
+            [ud synchronize];
+            item.isSwitchOn = sender.on;
+        }
+
+        // 玻璃门控：系统不支持时，无论用户怎么切都锁在 OFF
+        if (DKGlassIsGatedKey(item.identifier) && !DKGlassOSAvailable()) {
+            item.isSwitchOn = NO;
+            sender.on = NO;
+            NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+            [ud setBool:NO forKey:item.identifier];
+            [ud synchronize];
+        }
     } @catch (__unused NSException *e) {}
+
     [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:row inSection:section]]
                           withRowAnimation:UITableViewRowAnimationNone];
 }
