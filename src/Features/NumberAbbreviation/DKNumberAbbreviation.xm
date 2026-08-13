@@ -75,8 +75,10 @@ static BOOL DKShouldTransformLabelText(NSString *text) {
 
 #pragma mark - 递归遍历所有子视图中的 UILabel
 
-static void DKTransformLabelsInView(UIView *view) {
-    if (!view) return;
+// 用 id 做参数类型，避免 hook 不同 cell 类时 self（__unsafe_unretained const 指针）到 UIView* 的转换报错
+static void DKTransformLabelsInView(id viewRef) {
+    if (!viewRef || ![viewRef isKindOfClass:[UIView class]]) return;
+    UIView *view = (UIView *)viewRef;
     for (UIView *sub in view.subviews) {
         if ([sub isKindOfClass:[UILabel class]]) {
             UILabel *label = (UILabel *)sub;
@@ -96,33 +98,15 @@ static void DKTransformLabelsInView(UIView *view) {
 #pragma mark - 开关（默认开）
 
 static BOOL DKNumberAbbrevEnabled(void) {
-    return DKPrefBoolDefault(DKKeyNumberAbbreviation, YES);
+    // DKPrefBool(key) 默认返回 NO，我们要默认开，所以手动判空
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    if ([ud objectForKey:DKKeyNumberAbbreviation] == nil) return YES;
+    return [ud boolForKey:DKKeyNumberAbbreviation];
 }
 
 #pragma mark - Hook 常用 cell 类（layoutSubviews 之后递归替换所有 label）
 
 %group DKNumberAbbrevHook
-
-%hook NSObject (DYLiteNumberAbbrev)
-
-/*
-   我们不直接 hook 所有 UIView 的 layoutSubviews（性能差），
-   而是根据抖音的类名特征，分别 hook 几个常用 cell 类：
-   - AWEAwemeFeedCell：feed 视频卡片（底部点赞/评论/分享/收藏数）
-   - AWEAwemePersonalDetailCell：个人主页作品卡片
-   - AWEAwemeCollectionViewCell：通用作品 collection cell
-   - AWECommentCell：评论单条 cell（点赞数）
-   - AWESearchMusicAwemeListCell：搜索音乐页的作品列表
-   - AWEAwemeStoryCell：故事/快拍 cell
-   如果类在运行时不存在（类名不对），hook 会被 Logos 自动跳过，不会 crash。
-*/
-
-%new
-- (void)dylite_layoutAfterNumberAbbrev {
-    // 调用原始实现（因为我们用的是 original selector 替换，这里是个辅助方法）
-}
-
-%end
 
 // 1) Feed 视频卡片
 %hook AWEAwemeFeedCell
