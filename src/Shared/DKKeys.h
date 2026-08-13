@@ -38,4 +38,9 @@ static NSString *const DKKeyRemoveQushuiting = @"DYLiteRemoveQushuiting";
 // 移除关注按钮
 static NSString *const DKKeyRemoveFollowButton = @"DYLiteRemoveFollowButton";
 
+#pragma mark - 数字显示
+
+// 点赞/评论/收藏/分享数：以 k/M 国际单位显示（类似 TikTok 海外版风格）
+static NSString *const DKKeyNumberAbbreviation = @"DYLiteNumberAbbreviation";
+
 #endif /* DKKeys_h */
