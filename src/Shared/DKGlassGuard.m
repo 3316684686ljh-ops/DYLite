@@ -23,11 +23,9 @@ BOOL DKGlassOSAvailable(void) {
     static BOOL available;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        if (@available(iOS 26.0, *)) {
-            available = YES;
-        } else {
-            available = NO;
-        }
+        // 运行时比较系统版本，避免旧 SDK 下 @available(iOS 26.0, *) 报 warning
+        NSOperatingSystemVersion os26 = (NSOperatingSystemVersion){26, 0, 0};
+        available = [[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:os26];
     });
     return available;
 }

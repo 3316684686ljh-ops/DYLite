@@ -7,6 +7,8 @@
 //  2. 内容层在 AWESharePanelViewController 的 view 里（DUXVisualEffectView 包装）
 //  3. 找到弹层的背景槽位，替换成 UIGlassEffect
 //
+//  兼容性：全部用 runtime 反射 UIGlassEffect，兼容 SDK < iOS 26 编译
+//
 
 #import "DouyinHeaders.h"
 #import "DKGlassGuard.h"
@@ -15,6 +17,8 @@
 #import "DKUtils.h"
 
 #import <QuartzCore/QuartzCore.h>
+#import <objc/message.h>
+#import <objc/runtime.h>
 
 #pragma mark - 状态
 
@@ -33,38 +37,71 @@ static BOOL DKShareGlassUsesClear(void) {
     return DKGlassOSAvailable() && DKPrefBool(DKKeySharePanelGlassClear);
 }
 
-#pragma mark - 材质
+#pragma mark - UIGlassEffect 运行时封装
 
-static UIGlassEffect *DKMakeGlassEffect(UIUserInterfaceStyle style)
-    API_AVAILABLE(ios(26.0)) {
-    BOOL clear = DKShareGlassUsesClear();
-    UIGlassEffect *effect = [UIGlassEffect effectWithStyle:
-        clear ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular];
-    if (clear) effect.tintColor = DKGlassTintForStyle(style);
-    effect.interactive = YES;
+typedef NS_ENUM(NSInteger, DKShareGlassStyleRT) {
+    DKShareGlassStyleRTClear   = 0,
+    DKShareGlassStyleRTRegular = 1,
+};
+
+static Class DKShareGlassClass(void) {
+    static Class cls = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = NSClassFromString(@"UIGlassEffect");
+    });
+    return cls;
+}
+
+static UIVisualEffect *DKShareMakeGlassEffect(UIUserInterfaceStyle style) {
+    Class cls = DKShareGlassClass();
+    if (!cls) return nil;
+
+    DKShareGlassStyleRT s = DKShareGlassUsesClear()
+        ? DKShareGlassStyleRTClear
+        : DKShareGlassStyleRTRegular;
+
+    id (*msgSend)(id, SEL, NSInteger) = (typeof(msgSend))objc_msgSend;
+    SEL effectSel = NSSelectorFromString(@"effectWithStyle:");
+    id effect = msgSend(cls, effectSel, (NSInteger)s);
+
+    if (DKShareGlassUsesClear() && effect) {
+        UIColor *tint = DKGlassTintForStyle(style);
+        if (tint) [effect setValue:tint forKey:@"tintColor"];
+    }
+    if (effect) [effect setValue:@YES forKey:@"interactive"];
+
     return effect;
 }
 
 #pragma mark - 深浅色
 
-static void DKApplyGlassStyle(UIUserInterfaceStyle style) API_AVAILABLE(ios(26.0)) {
+static void DKApplyGlassStyle(UIUserInterfaceStyle style) {
     if (style == UIUserInterfaceStyleUnspecified || style == gGlassStyle) return;
     gGlassStyle = style;
 
     if (gPanelGlass) {
         gPanelGlass.overrideUserInterfaceStyle = style;
-        gPanelGlass.effect = DKMakeGlassEffect(style);
+        gPanelGlass.effect = DKShareMakeGlassEffect(style);
     }
 }
 
-static void DKObserveStyle(UIView *host) API_AVAILABLE(ios(26.0)) {
+static void DKObserveStyle(UIView *host) {
     UIWindowScene *scene = host.window.windowScene;
     if (!scene || scene == gObservedScene) return;
     gObservedScene = scene;
-    [scene registerForTraitChanges:@[ UITraitUserInterfaceStyle.class ]
-                       withHandler:^(UIWindowScene *changed, __unused UITraitCollection *previous) {
+
+    SEL registerSel = NSSelectorFromString(@"registerForTraitChanges:withHandler:");
+    if (![scene respondsToSelector:registerSel]) return;
+
+    NSArray *traits = @[ UITraitUserInterfaceStyle.class ];
+    void (^handler)(UIWindowScene *, UITraitCollection *) =
+        ^(UIWindowScene *changed, __unused UITraitCollection *previous) {
         DKApplyGlassStyle(changed.traitCollection.userInterfaceStyle);
-    }];
+    };
+
+    void (*msgSend)(id, SEL, NSArray *, id) = (typeof(msgSend))objc_msgSend;
+    msgSend(scene, registerSel, traits, handler);
 }
 
 #pragma mark - 安装/拆除
@@ -86,7 +123,7 @@ static UIView *DKFindPanelSlot(UIView *root) {
     return root;
 }
 
-static void DKInstallGlass(UIView *slot) API_AVAILABLE(ios(26.0)) {
+static void DKInstallGlass(UIView *slot) {
     if (!slot) return;
 
     // 移除旧玻璃
@@ -96,10 +133,12 @@ static void DKInstallGlass(UIView *slot) API_AVAILABLE(ios(26.0)) {
     }
 
     if (!DKShareGlassEnabled()) return;
+    if (!DKShareGlassClass()) return;
 
     if (!gPanelGlass) {
-        gPanelGlass =
-            [[UIVisualEffectView alloc] initWithEffect:DKMakeGlassEffect(gGlassStyle)];
+        UIVisualEffect *eff = DKShareMakeGlassEffect(gGlassStyle);
+        if (!eff) return;
+        gPanelGlass = [[UIVisualEffectView alloc] initWithEffect:eff];
         gPanelGlass.autoresizingMask =
             UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     }
@@ -123,12 +162,14 @@ static void DKInstallGlass(UIView *slot) API_AVAILABLE(ios(26.0)) {
 static void DKRemoveGlass(void) {
     if (!gPanelGlass) return;
     UIView *parent = gPanelGlass.superview;
-    for (UIView *sub in parent.subviews) {
-        if (sub == gPanelGlass) continue;
-        if ([sub isKindOfClass:UIVisualEffectView.class] ||
-            [NSStringFromClass(sub.class) containsString:@"Blur"] ||
-            [NSStringFromClass(sub.class) containsString:@"VisualEffect"]) {
-            if (sub.layer.opacity != 1.0f) sub.layer.opacity = 1.0f;
+    if (parent) {
+        for (UIView *sub in parent.subviews) {
+            if (sub == gPanelGlass) continue;
+            if ([sub isKindOfClass:UIVisualEffectView.class] ||
+                [NSStringFromClass(sub.class) containsString:@"Blur"] ||
+                [NSStringFromClass(sub.class) containsString:@"VisualEffect"]) {
+                if (sub.layer.opacity != 1.0f) sub.layer.opacity = 1.0f;
+            }
         }
     }
     [gPanelGlass removeFromSuperview];
@@ -138,7 +179,7 @@ static void DKRemoveGlass(void) {
 
 #pragma mark - 更新入口
 
-static void DKShareGlassUpdate(id container) API_AVAILABLE(ios(26.0)) {
+static void DKShareGlassUpdate(id container) {
     if (![container isKindOfClass:UIViewController.class]) return;
     UIViewController *vc = container;
     UIView *rootView = vc.view;
@@ -155,7 +196,6 @@ static void DKShareGlassUpdate(id container) API_AVAILABLE(ios(26.0)) {
     UIView *slot = DKFindPanelSlot(rootView);
     if (slot) {
         if (slot != gCurrentPanelSlot) {
-            // 槽位变了，先还原再重装
             DKRemoveGlass();
             gCurrentPanelSlot = slot;
         }
@@ -163,11 +203,10 @@ static void DKShareGlassUpdate(id container) API_AVAILABLE(ios(26.0)) {
     }
 }
 
-// 当主题刷新时也要重新应用（抖音可能重置背景层）
-static void DKShareGlassThemeReload(void) API_AVAILABLE(ios(26.0)) {
+// 主题刷新时重装
+static void DKShareGlassThemeReload(void) {
     if (!DKShareGlassEnabled()) return;
     if (gCurrentPanelSlot) {
-        // 重置状态，让下一次布局重装
         UIView *slot = gCurrentPanelSlot;
         gPanelGlass = nil;
         gCurrentPanelSlot = nil;
@@ -184,17 +223,17 @@ static void DKShareGlassThemeReload(void) API_AVAILABLE(ios(26.0)) {
 
 - (void)viewDidLayoutSubviews {
     %orig;
-    if (@available(iOS 26.0, *)) DKShareGlassUpdate(self);
+    DKShareGlassUpdate(self);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    if (@available(iOS 26.0, *)) DKShareGlassUpdate(self);
+    DKShareGlassUpdate(self);
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     %orig;
-    if (@available(iOS 26.0, *)) DKRemoveGlass();
+    DKRemoveGlass();
 }
 
 %end
@@ -203,12 +242,12 @@ static void DKShareGlassThemeReload(void) API_AVAILABLE(ios(26.0)) {
 
 - (void)awe_themeReload {
     %orig;
-    if (@available(iOS 26.0, *)) DKShareGlassThemeReload();
+    DKShareGlassThemeReload();
 }
 
 - (void)viewDidLayoutSubviews {
     %orig;
-    if (@available(iOS 26.0, *)) DKShareGlassUpdate(self);
+    DKShareGlassUpdate(self);
 }
 
 %end
@@ -235,9 +274,7 @@ static void DKShareGlassThemeReload(void) API_AVAILABLE(ios(26.0)) {
         void (^origBlock)(void) = [item.switchChangedBlock copy];
         item.switchChangedBlock = ^{
             if (origBlock) origBlock();
-            if (@available(iOS 26.0, *)) {
-                gGlassStyle = UIUserInterfaceStyleUnspecified;
-            }
+            gGlassStyle = UIUserInterfaceStyleUnspecified;
         };
         return item;
     });

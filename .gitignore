@@ -15,8 +15,3 @@ obj/
 
 # 忽略本地配置
 .local/
-
-# 忽略本地推送脚本（含Token）
-设置推送Token.bat
-*Token*.bat
-*token*.bat

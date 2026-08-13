@@ -24,27 +24,49 @@
 2. 填邮箱、密码、用户名，完成注册
 3. 登录 GitHub
 
-### 第 2 步：上传项目到 GitHub（1 分钟）
+### 第 2 步：上传项目到 GitHub（3 分钟）
 
-**直接双击 `推送代码(点我).bat` 即可！**
+**方法 A：用一键脚本（推荐）**
 
-脚本会自动：
-- 设置 Token（已嵌入）
-- 推送全部代码
-- 自动清理 Token URL
-- 打开 GitHub Actions 编译页面
+1. 双击项目目录里的 `一键编译.bat`
+2. 按提示输入你的 GitHub 用户名
+3. 脚本会自动帮你创建仓库、上传代码、触发编译
 
-> 如果双击失败，改用手动：
-> 1. 创建 GitHub 空仓库 https://github.com/new （名字 DYLite，不勾任何选项）
-> 2. 在项目目录右键 → Git Bash Here → 执行：
->    ```git remote set-url origin https://3316684686LJH-ops/DYLite.git && git push -u origin main```
+> 如果脚本提示输入密码，你需要用 **Token** 而不是登录密码：
+> - 打开 https://github.com/settings/tokens/new
+> - 勾选 `repo` 权限
+> - 点 `Generate token`，复制生成的 token
+> - 在命令行粘贴 token 作为密码
+
+**方法 B：手动上传**
+
+1. 打开 https://github.com/new
+2. 仓库名填 `DYLite`，选 Public，点 `Create repository`
+3. 在项目目录右键 → `Git Bash Here`，执行：
+   ```bash
+   git init
+   git add -A
+   git commit -m "Initial commit"
+   git branch -M main
+   git remote add origin https://github.com/你的用户名/DYLite.git
+   git push -u origin main
+   ```
 
 ### 第 3 步：下载安装包（等 3-5 分钟）
 
-1. 脚本自动打开 https://github.com/3316684686LJH-ops/DYLite/actions
-2. 看到绿色 ✅ 说明编译成功
-3. 点进去 → 滚到底部 Artifacts → 下载 DYLite-packages ZIP
-4. 解压得到 3 个 .deb 文件
+1. 上传代码后，GitHub 会自动开始编译
+2. 打开 https://github.com/你的用户名/DYLite/actions 看编译进度
+3. 编译成功后，有两种方式下载：
+
+   **方式 A：从 Artifacts 下载**（每次提交都会生成）
+   - 点击最新一条编译记录
+   - 页面最下方 `Artifacts` → 点 `DYLite-packages` 下载
+   - 解压 ZIP，里面有 3 个 .deb 文件
+
+   **方式 B：从 Release 下载**（需要打 tag）
+   - 在项目目录执行：`git tag v0.1.0 && git push origin v0.1.0`
+   - GitHub 会自动创建 Release 并上传 .deb
+   - 打开 https://github.com/你的用户名/DYLite/releases 下载
 
 ---
 
@@ -137,7 +159,7 @@ A: 可以直接在 GitHub 网页上传：
 ```
 DYLite/
 ├── .github/workflows/build.yml   ← GitHub 自动编译配置
-├── 推送代码(点我).bat             ← Windows 一键上传（含Token）
+├── 一键编译.bat                   ← Windows 一键上传脚本
 ├── Makefile                      ← Theos 编译配置
 ├── control                       ← deb 包信息
 ├── DYLite.plist                  ← 注入过滤器
@@ -146,7 +168,6 @@ DYLite/
     ├── Shared/                   ← 共享工具
     │   ├── DKKeys.h              ← 开关键定义
     │   ├── DKGlassGuard.h/.m     ← 玻璃版本守卫
-    │   ├── DKGlassRuntime.h/.m   ← 运行时反射层（iOS 26 API 访问）
     │   └── DKUtils.h/.m          ← 工具函数
     ├── Settings/
     │   └── DKSettingsMenu.xm     ← 设置菜单注入

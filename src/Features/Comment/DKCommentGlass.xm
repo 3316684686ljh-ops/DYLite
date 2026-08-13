@@ -8,6 +8,10 @@
 //  3. 输入框同理，跟随尺寸变化
 //  4. 深浅色从 UIWindowScene trait 取，因为抖音把 override 钉死为浅色
 //
+//  兼容性说明：
+//  - UIGlassEffect 是 iOS 26 新类，当前 Theos SDK 低于 26 时没有头文件声明
+//  - 所以这里全部用运行时反射（NSClassFromString / objc_msgSend / id）动态构造
+//
 
 #import "DKCommentGlass.h"
 #import "DouyinHeaders.h"
@@ -17,6 +21,7 @@
 #import "DKUtils.h"
 
 #import <QuartzCore/QuartzCore.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
 #pragma mark - 状态
@@ -41,50 +46,99 @@ static BOOL DKCommentGlassUsesClear(void) {
     return DKGlassOSAvailable() && DKPrefBool(DKKeyCommentGlassClear);
 }
 
-#pragma mark - 玻璃材质
+#pragma mark - UIGlassEffect 运行时封装（兼容 SDK < iOS 26）
 
-static UIGlassEffect *DKMakeGlassEffect(UIUserInterfaceStyle style, BOOL interactive)
-    API_AVAILABLE(ios(26.0)) {
-    BOOL clear = DKCommentGlassUsesClear();
-    UIGlassEffect *effect = [UIGlassEffect effectWithStyle:
-        clear ? UIGlassEffectStyleClear : UIGlassEffectStyleRegular];
-    if (clear) effect.tintColor = DKGlassTintForStyle(style);
-    effect.interactive = interactive;
+// 定义 SDK 里没有的枚举常量（和 UIGlassEffect.h 对齐）
+// 如果将来 SDK 升级为 26+ 并真正声明，这里的命名也不会冲突
+typedef NS_ENUM(NSInteger, DKGlassEffectStyleRT) {
+    DKGlassEffectStyleRTClear   = 0,
+    DKGlassEffectStyleRTRegular = 1,
+};
+
+static Class DKGlassEffectClass(void) {
+    static Class cls = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = NSClassFromString(@"UIGlassEffect");
+    });
+    return cls;
+}
+
+static BOOL DKGlassEffectClassAvailable(void) {
+    return DKGlassEffectClass() != Nil;
+}
+
+// 构造 UIGlassEffect 实例，通过 runtime 调 effectWithStyle:
+static UIVisualEffect *DKMakeGlassEffectRT(UIUserInterfaceStyle style, BOOL interactive) {
+    Class cls = DKGlassEffectClass();
+    if (!cls) return nil;
+
+    DKGlassEffectStyleRT s = DKCommentGlassUsesClear()
+        ? DKGlassEffectStyleRTClear
+        : DKGlassEffectStyleRTRegular;
+
+    // 等价于 [UIGlassEffect effectWithStyle:s]
+    id (*msgSend)(id, SEL, NSInteger) = (typeof(msgSend))objc_msgSend;
+    SEL effectSel = NSSelectorFromString(@"effectWithStyle:");
+    id effect = msgSend(cls, effectSel, (NSInteger)s);
+
+    // 如果是 Clear 风格，设置 tintColor
+    if (DKCommentGlassUsesClear() && effect) {
+        UIColor *tint = DKGlassTintForStyle(style);
+        if (tint) {
+            [effect setValue:tint forKey:@"tintColor"];
+        }
+    }
+
+    // 设置 interactive
+    if (effect) {
+        [effect setValue:@(interactive) forKey:@"interactive"];
+    }
+
     return effect;
 }
 
 #pragma mark - 深浅色
 
-static void DKApplyGlassStyle(UIUserInterfaceStyle style) API_AVAILABLE(ios(26.0)) {
+static void DKApplyGlassStyle(UIUserInterfaceStyle style) {
     if (style == UIUserInterfaceStyleUnspecified || style == gGlassStyle) return;
     gGlassStyle = style;
 
     if (gSlotGlass) {
         gSlotGlass.overrideUserInterfaceStyle = style;
-        gSlotGlass.effect = DKMakeGlassEffect(style, YES);
+        gSlotGlass.effect = DKMakeGlassEffectRT(style, YES);
     }
     if (gFieldGlass) {
         gFieldGlass.overrideUserInterfaceStyle = style;
-        gFieldGlass.effect = DKMakeGlassEffect(style, NO);
+        gFieldGlass.effect = DKMakeGlassEffectRT(style, NO);
     }
 }
 
-static void DKObserveStyle(UIView *host) API_AVAILABLE(ios(26.0)) {
+static void DKObserveStyle(UIView *host) {
     UIWindowScene *scene = host.window.windowScene;
     if (!scene || scene == gObservedScene) return;
     gObservedScene = scene;
-    [scene registerForTraitChanges:@[ UITraitUserInterfaceStyle.class ]
-                       withHandler:^(UIWindowScene *changed, __unused UITraitCollection *previous) {
+
+    // 用 respondsToSelector 保证旧 SDK 不会编译失败（selector 本身是字符串）
+    SEL registerSel = NSSelectorFromString(@"registerForTraitChanges:withHandler:");
+    if (![scene respondsToSelector:registerSel]) return;
+
+    NSArray *traits = @[ UITraitUserInterfaceStyle.class ];
+    void (^handler)(UIWindowScene *, UITraitCollection *) =
+        ^(UIWindowScene *changed, __unused UITraitCollection *previous) {
         DKApplyGlassStyle(changed.traitCollection.userInterfaceStyle);
-    }];
+    };
+
+    // 动态调用，参数签名: -(void)registerForTraitChanges:(NSArray*)t withHandler:(id)block
+    void (*msgSend)(id, SEL, NSArray *, id) = (typeof(msgSend))objc_msgSend;
+    msgSend(scene, registerSel, traits, handler);
 }
 
-#pragma mark - 玻璃安装/拆除
+#pragma mark - 玻璃安装/拆除（使用返回值，避免 __autoreleasing 双指针不匹配）
 
 // 找一个视图里最底层的模糊/背景层，返回它的父视图（即玻璃要插入的槽位）
 static UIView *DKFindBackdropSlot(UIView *root) {
     if (!root) return nil;
-    // 找第一个背景层（blur/纯色背景）的父视图
     for (UIView *sub in root.subviews) {
         if ([sub isKindOfClass:UIVisualEffectView.class] ||
             [NSStringFromClass(sub.class) containsString:@"Blur"] ||
@@ -93,32 +147,35 @@ static UIView *DKFindBackdropSlot(UIView *root) {
             return root;
         }
     }
-    // 如果子视图里找不到，继续深挖第一个子视图
     if (root.subviews.count > 0) {
         return DKFindBackdropSlot(root.subviews.firstObject);
     }
     return root;
 }
 
-static void DKInstallGlassOnSlot(UIView *slot, UIVisualEffectView **glassOut, BOOL interactive)
-    API_AVAILABLE(ios(26.0)) {
-    if (!slot || !glassOut) return;
+// 安装玻璃，返回新的 glass 实例（由调用方保存到全局变量）
+static UIVisualEffectView *DKInstallGlassOnSlotReturn(UIView *slot,
+                                                      UIVisualEffectView *oldGlass,
+                                                      BOOL interactive) {
+    if (!slot) return oldGlass;
 
     // 移除旧玻璃
-    if (*glassOut) {
-        [*glassOut removeFromSuperview];
-        *glassOut = nil;
+    if (oldGlass) {
+        [oldGlass removeFromSuperview];
+        oldGlass = nil;
     }
 
-    if (!DKCommentGlassEnabled()) return;
+    if (!DKCommentGlassEnabled()) return nil;
+    if (!DKGlassEffectClassAvailable()) return nil;   // 运行时类不存在直接退出
 
-    UIVisualEffectView *glass =
-        [[UIVisualEffectView alloc] initWithEffect:DKMakeGlassEffect(gGlassStyle, interactive)];
+    UIVisualEffect *effect = DKMakeGlassEffectRT(gGlassStyle, interactive);
+    if (!effect) return nil;
+
+    UIVisualEffectView *glass = [[UIVisualEffectView alloc] initWithEffect:effect];
     glass.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     glass.frame = slot.bounds;
-    [slot insertSubview:glass atIndex:0];   // 最底层，在所有内容之下
+    [slot insertSubview:glass atIndex:0];
 
-    // 把原来的背景层 opacity=0（如果存在）
     for (UIView *sub in slot.subviews) {
         if (sub == glass) continue;
         if ([sub isKindOfClass:UIVisualEffectView.class] ||
@@ -127,31 +184,31 @@ static void DKInstallGlassOnSlot(UIView *slot, UIVisualEffectView **glassOut, BO
             if (sub.layer.opacity != 0.0f) sub.layer.opacity = 0.0f;
         }
     }
-
-    *glassOut = glass;
+    return glass;
 }
 
-static void DKRemoveGlassFromSlot(UIView *slot, UIVisualEffectView **glassOut) {
-    if (!glassOut || !*glassOut) return;
-    UIVisualEffectView *glass = *glassOut;
-
-    // 还原原来的背景层 opacity
+// 拆除玻璃，返回 nil（由调用方保存到全局变量）
+static UIVisualEffectView *DKRemoveGlassFromSlotReturn(UIView *slot,
+                                                       UIVisualEffectView *glass) {
+    if (!glass) return nil;
     UIView *parent = glass.superview;
-    for (UIView *sub in parent.subviews) {
-        if (sub == glass) continue;
-        if ([sub isKindOfClass:UIVisualEffectView.class] ||
-            [NSStringFromClass(sub.class) containsString:@"Blur"] ||
-            [NSStringFromClass(sub.class) containsString:@"Backdrop"]) {
-            if (sub.layer.opacity != 1.0f) sub.layer.opacity = 1.0f;
+    if (parent) {
+        for (UIView *sub in parent.subviews) {
+            if (sub == glass) continue;
+            if ([sub isKindOfClass:UIVisualEffectView.class] ||
+                [NSStringFromClass(sub.class) containsString:@"Blur"] ||
+                [NSStringFromClass(sub.class) containsString:@"Backdrop"]) {
+                if (sub.layer.opacity != 1.0f) sub.layer.opacity = 1.0f;
+            }
         }
     }
     [glass removeFromSuperview];
-    *glassOut = nil;
+    return nil;
 }
 
 #pragma mark - 更新入口
 
-static void DKCommentGlassUpdate(id controller) API_AVAILABLE(ios(26.0)) {
+static void DKCommentGlassUpdate(id controller) {
     if (![controller isKindOfClass:UIViewController.class]) return;
     UIViewController *vc = controller;
 
@@ -163,8 +220,8 @@ static void DKCommentGlassUpdate(id controller) API_AVAILABLE(ios(26.0)) {
 
     if (!DKCommentGlassEnabled()) {
         // 关开关：拆除玻璃
-        if (gSlotGlass) DKRemoveGlassFromSlot(gCurrentSlot, &gSlotGlass);
-        if (gFieldGlass) DKRemoveGlassFromSlot(gCurrentField, &gFieldGlass);
+        gSlotGlass = DKRemoveGlassFromSlotReturn(gCurrentSlot, gSlotGlass);
+        gFieldGlass = DKRemoveGlassFromSlotReturn(gCurrentField, gFieldGlass);
         gCurrentSlot = nil;
         gCurrentField = nil;
         return;
@@ -173,8 +230,8 @@ static void DKCommentGlassUpdate(id controller) API_AVAILABLE(ios(26.0)) {
     // 1. 评论主面板
     UIView *slot = DKFindBackdropSlot(rootView);
     if (slot && slot != gCurrentSlot) {
-        DKRemoveGlassFromSlot(gCurrentSlot, &gSlotGlass);
-        DKInstallGlassOnSlot(slot, &gSlotGlass, YES);
+        gSlotGlass = DKRemoveGlassFromSlotReturn(gCurrentSlot, gSlotGlass);
+        gSlotGlass = DKInstallGlassOnSlotReturn(slot, gSlotGlass, YES);
         gCurrentSlot = slot;
     } else if (slot && gSlotGlass) {
         // 尺寸跟随
@@ -187,8 +244,8 @@ static void DKCommentGlassUpdate(id controller) API_AVAILABLE(ios(26.0)) {
     for (UIView *sub in rootView.subviews) {
         if ([NSStringFromClass(sub.class) isEqualToString:@"AWECommentInputBackgroundView"]) {
             if (sub != gCurrentField) {
-                DKRemoveGlassFromSlot(gCurrentField, &gFieldGlass);
-                DKInstallGlassOnSlot(sub, &gFieldGlass, NO);
+                gFieldGlass = DKRemoveGlassFromSlotReturn(gCurrentField, gFieldGlass);
+                gFieldGlass = DKInstallGlassOnSlotReturn(sub, gFieldGlass, NO);
                 gCurrentField = sub;
             } else if (gFieldGlass) {
                 if (!CGRectEqualToRect(gFieldGlass.frame, sub.bounds)) {
@@ -208,12 +265,12 @@ static void DKCommentGlassUpdate(id controller) API_AVAILABLE(ios(26.0)) {
 
 - (void)viewDidLayoutSubviews {
     %orig;
-    if (@available(iOS 26.0, *)) DKCommentGlassUpdate(self);
+    DKCommentGlassUpdate(self);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-    if (@available(iOS 26.0, *)) DKCommentGlassUpdate(self);
+    DKCommentGlassUpdate(self);
 }
 
 %end
@@ -227,28 +284,14 @@ static void DKCommentGlassUpdate(id controller) API_AVAILABLE(ios(26.0)) {
         return DKMakeSwitch(
             DKKeyCommentGlass,
             @"评论区液态玻璃",
-            @"给评论面板加上 iOS 26 原生液态玻璃效果"
-        );
+            @"给评论面板和输入框添加 iOS 26 液态玻璃效果（需要 iOS 26+）",
+            YES);
     });
-
     DKSettingsRegisterItem(@"评论区", ^AWESettingItemModel *{
-        AWESettingItemModel *item = DKMakeSwitch(
+        return DKMakeSwitch(
             DKKeyCommentGlassClear,
-            @"清透玻璃",
-            @"开启后使用清透玻璃（细节可辨），关闭则使用系统默认磨砂材质"
-        );
-        // 开关变化时立即刷新
-        void (^origBlock)(void) = [item.switchChangedBlock copy];
-        item.switchChangedBlock = ^{
-            if (origBlock) origBlock();
-            if (@available(iOS 26.0, *)) {
-                gGlassStyle = UIUserInterfaceStyleUnspecified;
-            }
-        };
-        return item;
+            @"评论区玻璃 Clear 风格",
+            @"使用透明的液态玻璃（需开启上面的开关）",
+            YES);
     });
-
-    if (DKGlassOSAvailable()) {
-        %init(DKCommentGlassHooks);
-    }
 }
