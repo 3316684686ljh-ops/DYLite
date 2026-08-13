@@ -294,4 +294,8 @@ static void DKCommentGlassUpdate(id controller) {
             @"使用透明的液态玻璃（需开启上面的开关）",
             YES);
     });
+
+    if (DKGlassOSAvailable()) {
+        %init(DKCommentGlassHooks);
+    }
 }
