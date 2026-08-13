@@ -1,15 +1,19 @@
 //
 //  DKSettingsMenu.xm
-//  注入 DYLite 设置入口 + 弹出插件设置页
 //  ============================================================
-//  修复"空白页"原因：
-//  1) 自己 alloc 的 AWESettingsViewModel 不能直接 setSectionDataArray 就完事，
-//     因为 sectionDataArray 里的 section / item 可能还需要经过官方的进一步处理
-//     才能被 VC 的 data source 认出来。
-//  2) 用 objc_setAssociatedObject 给我们 detailVm 打一个"DYLite VM"标签，
-//     然后 hook sectionDataArray 的 getter，让它在运行时返回我们实时构建的数据，
-//     完美避开各功能模块 %ctor 注册顺序导致的空数组。
-//  3) 补齐 viewModel / item 常用属性，降低抖音内部数据源断言/异常的几率。
+//  100% 独立的设置页方案（修复"设置空白"根本原因）
+//
+//  之前空白的原因：
+//    旧代码 hook 了 AWESettingsViewModel 的 init，在 init 时把 sectionDataArray
+//    覆写成只含我们入口项的数组 —— 直接把抖音整个设置页的数据冲掉了。
+//
+//  新方案（零破坏性）：
+//    1) 入口 A：hook AWESettingBaseViewController.viewDidLoad，加一个右上角导航按钮
+//       "DYLite" —— 完全不碰数据源，绝对不会让设置页空白。
+//    2) 入口 B（备份）：hook AWESettingsViewModel.sectionDataArray 的 getter，
+//       非破坏性地在末尾追加一个"插件"入口分区（只读不改原数据）。
+//    3) 设置详情页：完全自建的 UIKit UITableViewController（DKStandaloneSettingsVC），
+//       不依赖 AWESettingBaseViewController / AWESettingsViewModel 的任何渲染逻辑。
 //
 
 #import "DouyinHeaders.h"
@@ -31,7 +35,10 @@ static NSMutableArray<NSDictionary *> *DKSectionRegistry(void) {
 
 void DKSettingsRegisterItem(NSString *sectionHeader, DKSettingItemBuilder builder) {
     if (!sectionHeader || !builder) return;
-    [DKSectionRegistry() addObject:@{ @"header": sectionHeader, @"builder": [builder copy] }];
+    NSMutableArray *registry = DKSectionRegistry();
+    @synchronized(registry) {
+        [registry addObject:@{ @"header": sectionHeader, @"builder": [builder copy] }];
+    }
 }
 
 #pragma mark - 液态玻璃设置项守卫
@@ -68,220 +75,287 @@ AWESettingItemModel *DKMakeSwitch(NSString *key, NSString *title, NSString *deta
     item.isEnable   = YES;
     item.isSwitchOn = DKPrefBool(key);
 
-    __weak AWESettingItemModel *weakItem = item;
-    item.switchChangedBlock = ^{
-        __strong AWESettingItemModel *it = weakItem;
-        if (!it) return;
-        BOOL v = !it.isSwitchOn;
-        it.isSwitchOn = v;
-        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-        [ud setBool:v forKey:it.identifier];
-        [ud synchronize];
-    };
     DKGlassLockItemIfNeeded(item);
     return item;
 }
 
-#pragma mark - 动态构建设置页 section（每次 getter 调用都会重新构建，确保永远有数据）
+#pragma mark - 读取开关值（带默认值）
 
-static NSArray *DKBuildSectionData(void) {
+static BOOL DKSettingsReadValue(NSString *key) {
+    // 数字缩写功能默认开
+    if ([key isEqualToString:DKKeyNumberAbbreviation]) {
+        if ([[NSUserDefaults standardUserDefaults] objectForKey:key] == nil) return YES;
+    }
+    return DKPrefBool(key);
+}
+
+#pragma mark - ============================================================
+//  独立设置页 VC（纯 UIKit，零抖音依赖）
+//  ============================================================
+
+@interface DKStandaloneSettingsVC : UITableViewController
+@end
+
+@implementation DKStandaloneSettingsVC {
+    // 每个元素: @{ @"header": NSString, @"items": NSArray }
+    // items 里的元素要么是 AWESettingItemModel，要么是关于分区的 NSDictionary
+    NSArray *_dkSections;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.navigationItem.title = @"DYLite 设置";
+    self.tableView.separatorStyle = UITableViewCellSeparatorStyleSingleLine;
+    self.tableView.estimatedRowHeight = 60;
+    self.tableView.rowHeight = UITableViewAutomaticDimension;
+
+    [self dk_buildSections];
+}
+
+- (void)dk_buildSections {
+    NSMutableArray *sections = [NSMutableArray array];
     NSMutableDictionary<NSString *, NSMutableArray *> *groups = [NSMutableDictionary dictionary];
-    NSMutableArray<NSString *> *headerOrder = [NSMutableArray array];
+    NSMutableArray<NSString *> *order = [NSMutableArray array];
 
-    for (NSDictionary *entry in DKSectionRegistry()) {
+    NSMutableArray *registry = DKSectionRegistry();
+    NSArray *snapshot;
+    @synchronized(registry) {
+        snapshot = [registry copy];
+    }
+
+    for (NSDictionary *entry in snapshot) {
         NSString *header = entry[@"header"];
         DKSettingItemBuilder builder = entry[@"builder"];
         if (!header || !builder) continue;
-        AWESettingItemModel *item = builder();
-        if (!item) continue;
+        @try {
+            AWESettingItemModel *item = builder();
+            if (!item) continue;
+            if (!groups[header]) {
+                groups[header] = [NSMutableArray array];
+                [order addObject:header];
+            }
+            [groups[header] addObject:item];
+        } @catch (__unused NSException *e) {}
+    }
 
-        if (!groups[header]) {
-            groups[header] = [NSMutableArray array];
-            [headerOrder addObject:header];
+    for (NSString *header in order) {
+        [sections addObject:@{ @"header": header, @"items": [groups[header] copy] }];
+    }
+
+    // 关于分区（始终存在，保证页面永远不会空白）
+    [sections addObject:@{
+        @"header": @"关于",
+        @"items": @[
+            @{ @"__about__": @(YES),
+               @"title": [NSString stringWithFormat:@"DYLite v%@", DK_VERSION],
+               @"detail": @"抖音增强插件 · 独立设置页" }
+        ]
+    }];
+
+    _dkSections = [sections copy];
+}
+
+#pragma mark - Data Source
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
+    return _dkSections.count;
+}
+
+- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
+    if (section < 0 || section >= (NSInteger)_dkSections.count) return 0;
+    return [_dkSections[section][@"items"] count];
+}
+
+- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)section {
+    if (section < 0 || section >= (NSInteger)_dkSections.count) return nil;
+    return _dkSections[section][@"header"];
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    id raw = nil;
+    @try {
+        raw = _dkSections[indexPath.section][@"items"][indexPath.row];
+    } @catch (__unused NSException *e) {}
+
+    // 关于分区
+    if ([raw isKindOfClass:[NSDictionary class]]) {
+        UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                                       reuseIdentifier:@"dk_about"];
+        NSDictionary *d = (NSDictionary *)raw;
+        cell.textLabel.text = d[@"title"];
+        cell.detailTextLabel.text = d[@"detail"];
+        cell.detailTextLabel.textColor = [UIColor grayColor];
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.textLabel.numberOfLines = 0;
+        return cell;
+    }
+
+    AWESettingItemModel *item = (AWESettingItemModel *)raw;
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
+                                                   reuseIdentifier:@"dk_switch"];
+    cell.textLabel.text       = item.title ?: @"";
+    cell.textLabel.numberOfLines = 0;
+    cell.detailTextLabel.text = item.detail ?: @"";
+    cell.detailTextLabel.textColor = [UIColor grayColor];
+    cell.detailTextLabel.numberOfLines = 0;
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+
+    UISwitch *sw = [[UISwitch alloc] init];
+    sw.tag = (NSInteger)indexPath.section * 10000 + (NSInteger)indexPath.row;
+    [sw addTarget:self action:@selector(dk_switchChanged:) forControlEvents:UIControlEventValueChanged];
+    sw.on = DKSettingsReadValue(item.identifier);
+    sw.enabled = item.isEnable;
+    cell.accessoryView = sw;
+    return cell;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tv deselectRowAtIndexPath:indexPath animated:YES];
+}
+
+#pragma mark - Switch 回调
+
+- (void)dk_switchChanged:(UISwitch *)sender {
+    NSInteger section = sender.tag / 10000;
+    NSInteger row = sender.tag % 10000;
+    @try {
+        id raw = _dkSections[section][@"items"][row];
+        if (![raw isKindOfClass:NSClassFromString(@"AWESettingItemModel")]) return;
+        AWESettingItemModel *item = (AWESettingItemModel *)raw;
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        [ud setBool:sender.on forKey:item.identifier];
+        [ud synchronize];
+        item.isSwitchOn = sender.on;
+    } @catch (__unused NSException *e) {}
+    [self.tableView reloadRowsAtIndexPaths:@[[NSIndexPath indexPathForRow:row inSection:section]]
+                          withRowAnimation:UITableViewRowAnimationNone];
+}
+
+@end
+
+#pragma mark - ============================================================
+//  入口跳转 Target（导航按钮 & cell 点击都用它）
+//  ============================================================
+
+@interface DKSettingsEntryTarget : NSObject
++ (instancetype)shared;
+- (void)openSettings;
+@end
+
+@implementation DKSettingsEntryTarget
+
++ (instancetype)shared {
+    static DKSettingsEntryTarget *s;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [DKSettingsEntryTarget new]; });
+    return s;
+}
+
+- (void)openSettings {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *w = [UIApplication sharedApplication].keyWindow;
+        if (!w) {
+            for (UIWindow *win in [UIApplication sharedApplication].windows) {
+                if (win.windowLevel == UIWindowLevelNormal && win.bounds.size.width > 0) {
+                    w = win;
+                    break;
+                }
+            }
         }
-        [groups[header] addObject:item];
-    }
+        if (!w) return;
 
-    NSMutableArray *sections = [NSMutableArray array];
-    for (NSString *header in headerOrder) {
-        AWESettingSectionModel *section = [[%c(AWESettingSectionModel) alloc] init];
-        if (!section) continue;
-        section.sectionHeaderTitle  = header;
-        section.sectionHeaderHeight = 44.0f;
-        section.itemArray           = groups[header];
-        [sections addObject:section];
-    }
-    return sections;
+        UIViewController *top = w.rootViewController;
+        while (top.presentedViewController) top = top.presentedViewController;
+        while ([top isKindOfClass:[UINavigationController class]]) {
+            UINavigationController *nav = (UINavigationController *)top;
+            UIViewController *visible = nav.visibleViewController ?: nav.topViewController;
+            if (visible && visible != top) {
+                top = visible;
+                if (top.presentedViewController) {
+                    top = top.presentedViewController;
+                    continue;
+                }
+            }
+            break;
+        }
+
+        DKStandaloneSettingsVC *vc = [[DKStandaloneSettingsVC alloc] initWithStyle:UITableViewStyleGrouped];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+        nav.modalPresentationStyle = UIModalPresentationFullScreen;
+        [top presentViewController:nav animated:YES completion:nil];
+    });
 }
 
-#pragma mark - DYLite VM 标签 + getter hook
+@end
 
-static const void *kDKIsDYLiteVMTagKey = &kDKIsDYLiteVMTagKey;
-static const void *kDKCachedSectionsKey  = &kDKCachedSectionsKey;
+#pragma mark - ============================================================
+//  入口 A：抖音设置页右上角导航按钮（非破坏性，推荐入口）
+//  ============================================================
 
-static void DKTagAsDYLiteVM(AWESettingsViewModel *vm) {
-    if (!vm) return;
-    objc_setAssociatedObject(vm, kDKIsDYLiteVMTagKey, @(YES), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+%group DKEntryNavButton
+
+%hook AWESettingBaseViewController
+
+- (void)viewDidLoad {
+    %orig;
+    @try {
+        UIBarButtonItem *btn = [[UIBarButtonItem alloc] initWithTitle:@"DYLite"
+                                                                 style:UIBarButtonItemStylePlain
+                                                                target:[DKSettingsEntryTarget shared]
+                                                                action:@selector(openSettings)];
+        self.navigationItem.rightBarButtonItem = btn;
+    } @catch (__unused NSException *e) {}
 }
 
-static BOOL DKIsDYLiteVM(id vm) {
-    return [objc_getAssociatedObject(vm, kDKIsDYLiteVMTagKey) boolValue];
-}
+%end
 
-%group DKSettingsVMHook
+%end
+
+#pragma mark - ============================================================
+//  入口 B（备份）：sectionDataArray getter 末尾追加"插件"入口
+//  非破坏性 —— 只读 %orig 再追加，永远不调用 setter，不会冲掉原数据
+//  ============================================================
+
+%group DKEntrySection
 
 %hook AWESettingsViewModel
 
 - (NSArray *)sectionDataArray {
-    if (DKIsDYLiteVM(self)) {
-        // 自己的 DYLite 设置页 VM：每次都返回实时构建数据 + 缓存
-        NSArray *cached = objc_getAssociatedObject(self, kDKCachedSectionsKey);
-        if (cached) return cached;
-        NSArray *built = DKBuildSectionData();
-        objc_setAssociatedObject(self, kDKCachedSectionsKey, built, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        return built;
-    }
-    return %orig;
-}
+    NSArray *orig = %orig;
+    if (!orig) orig = @[];
 
-- (NSInteger)colorStyle {
-    if (DKIsDYLiteVM(self)) return 0;
-    return %orig;
-}
-
-- (void)setColorStyle:(NSInteger)style {
-    if (DKIsDYLiteVM(self)) return;
-    %orig;
-}
-
-%end
-
-%end
-
-#pragma mark - 入口注入：抖音主设置页 sectionDataArray 末尾追加 "插件" 分区
-
-%group DKEntryHook
-
-%hook AWESettingsViewModel
-
-- (instancetype)init {
-    self = %orig;
-    if (!self) return nil;
-
-    // 不要在 DYLite 自己的 VM 上再加入口了（否则无限递归）
-    if (DKIsDYLiteVM(self)) return self;
-
-    @try {
-        NSMutableArray *sections = [self respondsToSelector:@selector(sectionDataArray)]
-            ? [[(id)self sectionDataArray] mutableCopy]
-            : nil;
-        if (!sections) sections = [NSMutableArray array];
-
-        AWESettingSectionModel *entrySection = [[%c(AWESettingSectionModel) alloc] init];
-        entrySection.sectionHeaderTitle  = @"插件";
-        entrySection.sectionHeaderHeight = 44.0f;
-
-        AWESettingItemModel *entryItem = [[%c(AWESettingItemModel) alloc] init];
-        entryItem.identifier = @"DYLiteEntry";
-        entryItem.title      = @"DYLite 增强设置";
-        entryItem.detail     = [NSString stringWithFormat:@"v%@", DK_VERSION];
-        entryItem.type       = 0;
-        entryItem.cellType   = 26;           // 可点击：右侧箭头
-        entryItem.colorStyle = 0;
-        entryItem.isEnable   = YES;
-
-        __weak AWESettingsViewModel *weakSelf = self;
-        entryItem.cellTappedBlock = ^{
-            AWESettingsViewModel *strongSelf = weakSelf;
-            if (!strongSelf) return;
-
-            // 获取当前 VC presenter
-            UIViewController *presenter = nil;
-            @try {
-                id del = [strongSelf valueForKey:@"controllerDelegate"];
-                if ([del isKindOfClass:UIViewController.class]) presenter = del;
-            } @catch (__unused NSException *e) {}
-            if (!presenter) {
-                // 兜底：取最顶层的 VC
-                UIWindow *w = [UIApplication sharedApplication].keyWindow;
-                presenter = w.rootViewController;
-                while (presenter.presentedViewController) presenter = presenter.presentedViewController;
+    // 安全检查：如果原数据里已经有 DYLiteEntry 就不重复追加
+    for (id sec in orig) {
+        if (![sec isKindOfClass:NSClassFromString(@"AWESettingSectionModel")]) continue;
+        NSArray *items = [(AWESettingSectionModel *)sec itemArray];
+        for (id it in items) {
+            if (![it isKindOfClass:NSClassFromString(@"AWESettingItemModel")]) continue;
+            if ([[(AWESettingItemModel *)it identifier] isEqualToString:@"DYLiteEntry"]) {
+                return orig;
             }
-            if (!presenter) return;
-
-            // 创建 detail VM
-            AWESettingsViewModel *detailVm = [[%c(AWESettingsViewModel) alloc] init];
-            detailVm.colorStyle = 0;
-            DKTagAsDYLiteVM(detailVm);
-            // 先调用一下 sectionDataArray 强制预热缓存（可选）
-            (void)[detailVm sectionDataArray];
-
-            // 创建设置页 VC：优先尝试官方的初始化方法，失败再 fallback
-            // 【重要】不要用 %c(AWESettingBaseViewController)，因为这个类是抖音二进制里的动态类，
-            // 我们编译/链接时没有这个类的 OBJC_CLASS 符号，会导致 ld Undefined symbols。
-            // 改用 NSClassFromString 运行时取类，不会产生硬链接符号。
-            Class settingVCCls = NSClassFromString(@"AWESettingBaseViewController");
-            AWESettingBaseViewController *detailVc = nil;
-            if (settingVCCls) {
-                @try {
-                    // 尝试 initWithViewModel:（如有）
-                    SEL initSel = NSSelectorFromString(@"initWithViewModel:");
-                    if ([settingVCCls instancesRespondToSelector:initSel]) {
-                        id (*msgSend)(id, SEL, id) = (typeof(msgSend))objc_msgSend;
-                        detailVc = msgSend([settingVCCls alloc], initSel, detailVm);
-                    }
-                } @catch (__unused NSException *e) {}
-
-                if (!detailVc) {
-                    detailVc = [[settingVCCls alloc] init];
-                    if (detailVc) {
-                        @try { [detailVc setValue:detailVm forKey:@"viewModel"]; } @catch (__unused NSException *e) {}
-                    }
-                }
-            }
-            if (!detailVc) return;
-
-            detailVc.navigationItem.title = @"DYLite 设置";
-
-            // 页面进去之后强制再刷新一次（解决空白页杀手锏）
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                @try {
-                    SEL reloadSel = NSSelectorFromString(@"reloadData");
-                    if ([detailVc respondsToSelector:reloadSel]) {
-                        void (*msgSend)(id, SEL) = (typeof(msgSend))objc_msgSend;
-                        msgSend(detailVc, reloadSel);
-                    }
-                    // 尝试获取内部 tableView 也 reload 一下
-                    for (UIView *v in [detailVc.view subviews]) {
-                        if ([v isKindOfClass:[UITableView class]]) {
-                            [(UITableView *)v reloadData];
-                        }
-                    }
-                } @catch (__unused NSException *e) {}
-            });
-
-            UINavigationController *nav = presenter.navigationController;
-            if (nav) {
-                [nav pushViewController:detailVc animated:YES];
-            } else {
-                UINavigationController *n = [[UINavigationController alloc] initWithRootViewController:detailVc];
-                n.modalPresentationStyle = UIModalPresentationFullScreen;
-                [presenter presentViewController:n animated:YES completion:nil];
-            }
-        };
-
-        entrySection.itemArray = @[ entryItem ];
-        [sections addObject:entrySection];
-
-        // 赋值回去（如果不可写就用 KVC 兜底）
-        @try {
-            self.sectionDataArray = sections;
-        } @catch (__unused NSException *e) {
-            @try { [self setValue:sections forKey:@"sectionDataArray"]; } @catch (__unused NSException *e2) {}
         }
-    } @catch (__unused NSException *e) {}
+    }
 
-    return self;
+    AWESettingItemModel *entryItem = [[%c(AWESettingItemModel) alloc] init];
+    if (!entryItem) return orig;
+    entryItem.identifier = @"DYLiteEntry";
+    entryItem.title      = @"DYLite 增强设置";
+    entryItem.detail     = [NSString stringWithFormat:@"v%@  >  点击进入", DK_VERSION];
+    entryItem.type       = 0;
+    entryItem.cellType   = 26;           // 可点击：右侧箭头
+    entryItem.colorStyle = 0;
+    entryItem.isEnable   = YES;
+    entryItem.cellTappedBlock = ^{
+        [[DKSettingsEntryTarget shared] openSettings];
+    };
+
+    AWESettingSectionModel *entrySection = [[%c(AWESettingSectionModel) alloc] init];
+    if (!entrySection) return orig;
+    entrySection.sectionHeaderTitle  = @"插件";
+    entrySection.sectionHeaderHeight = 44.0f;
+    entrySection.itemArray           = @[ entryItem ];
+
+    return [orig arrayByAddingObject:entrySection];
 }
 
 %end
@@ -291,7 +365,6 @@ static BOOL DKIsDYLiteVM(id vm) {
 #pragma mark - 构造函数
 
 %ctor {
-    // 先把 group 初始化（Logos 语法要求）
-    %init(DKSettingsVMHook);
-    %init(DKEntryHook);
+    %init(DKEntryNavButton);
+    %init(DKEntrySection);
 }
