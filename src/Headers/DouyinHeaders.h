@@ -9,6 +9,8 @@
 
 #import <UIKit/UIKit.h>
 
+@class AWEAwemeModel;  // 前向声明，避免第16行属性声明时未知类型
+
 #pragma mark - 视频全屏功能用到的类
 
 // 视频+交互合并容器，其 .view 用于视频容器布局调整
